@@ -71,10 +71,39 @@ class BatchNorm(KL.BatchNormalization):
 ############################################################
 
 # Code adopted from:
+# https://gist.github.com/mjdietzx/0cb95922aac14d446a6530f87b3a04ce
+
+def grouped_convolution(input, nb_channels, kernel_size,
+                        name ,use_bias, padding, _strides=(1, 1), cardinality = 1):
+    # when `cardinality` == 1 this is just a standard convolution
+    if cardinality == 1:
+        return KL.Conv2D(nb_channels, kernel_size=kernel_size,
+                         strides=_strides, name= name,
+                         use_bias=use_bias, kernel_initializer='he_normal', padding=padding)(input)
+
+    assert not nb_channels % cardinality
+    _d = nb_channels // cardinality
+
+    # in a grouped convolution layer, input and output channels are divided into `cardinality` groups,
+    # and convolutions are separately performed within each group
+    group_list = []
+    for j in range(cardinality):
+        y = KL.Lambda(lambda z: z[:, :, :, j * _d:j * _d + _d])(input)
+        y = KL.Conv2D(_d, kernel_size=kernel_size,
+                                strides=_strides, name= name + '_' + str(j),
+                                use_bias=use_bias, kernel_initializer='he_normal', padding=padding)(y)
+        group_list.append(y)
+
+    # the grouped convolutional layer concatenates them as the outputs of the layer
+    y = KL.concatenate(group_list, name = name)
+
+    return y
+
+# Code adopted from:
 # https://github.com/fchollet/deep-learning-models/blob/master/resnet50.py
 
 def identity_block(input_tensor, kernel_size, filters, stage, block,
-                   use_bias=True):
+                   use_bias=True, cardinality = 1):
     """The identity_block is the block that has no conv layer at shortcut
     # Arguments
         input_tensor: input tensor
@@ -82,6 +111,7 @@ def identity_block(input_tensor, kernel_size, filters, stage, block,
         filters: list of integers, the nb_filters of 3 conv layer at main path
         stage: integer, current stage label, used for generating layer names
         block: 'a','b'..., current block label, used for generating layer names
+        cardinality: cardinality of ResNext (ResNet for a cardinality of 1)
     """
     nb_filter1, nb_filter2, nb_filter3 = filters
     conv_name_base = 'res' + str(stage) + block + '_branch'
@@ -92,8 +122,8 @@ def identity_block(input_tensor, kernel_size, filters, stage, block,
     x = BatchNorm(axis=3, name=bn_name_base + '2a')(x)
     x = KL.Activation('relu')(x)
 
-    x = KL.Conv2D(nb_filter2, (kernel_size, kernel_size), padding='same',
-                  name=conv_name_base + '2b', use_bias=use_bias)(x)
+    x = grouped_convolution(x,nb_filter2, (kernel_size, kernel_size), padding='same',
+                  name=conv_name_base + '2b', use_bias=use_bias, cardinality=cardinality)
     x = BatchNorm(axis=3, name=bn_name_base + '2b')(x)
     x = KL.Activation('relu')(x)
 
@@ -107,7 +137,7 @@ def identity_block(input_tensor, kernel_size, filters, stage, block,
 
 
 def conv_block(input_tensor, kernel_size, filters, stage, block,
-               strides=(2, 2), use_bias=True):
+               strides=(2, 2), use_bias=True, cardinality = 1):
     """conv_block is the block that has a conv layer at shortcut
     # Arguments
         input_tensor: input tensor
@@ -115,6 +145,7 @@ def conv_block(input_tensor, kernel_size, filters, stage, block,
         filters: list of integers, the nb_filters of 3 conv layer at main path
         stage: integer, current stage label, used for generating layer names
         block: 'a','b'..., current block label, used for generating layer names
+        cardinality: cardinality of ResNext (ResNet for a cardinality of 1)
     Note that from stage 3, the first conv layer at main path is with subsample=(2,2)
     And the shortcut should have subsample=(2,2) as well
     """
@@ -127,8 +158,8 @@ def conv_block(input_tensor, kernel_size, filters, stage, block,
     x = BatchNorm(axis=3, name=bn_name_base + '2a')(x)
     x = KL.Activation('relu')(x)
 
-    x = KL.Conv2D(nb_filter2, (kernel_size, kernel_size), padding='same',
-                  name=conv_name_base + '2b', use_bias=use_bias)(x)
+    x = grouped_convolution(x, nb_filter2, (kernel_size, kernel_size), padding='same',
+                            name=conv_name_base + '2b', use_bias=use_bias, cardinality=cardinality)
     x = BatchNorm(axis=3, name=bn_name_base + '2b')(x)
     x = KL.Activation('relu')(x)
 
@@ -145,8 +176,9 @@ def conv_block(input_tensor, kernel_size, filters, stage, block,
     return x
 
 
-def resnet_graph(input_image, architecture, stage5=False):
+def resnet_graph(input_image, architecture, stage5=False, use_resnext = False):
     assert architecture in ["resnet50", "resnet101"]
+    cardinality = 32 if use_resnext else 1
     # Stage 1
     x = KL.ZeroPadding2D((3, 3))(input_image)
     x = KL.Conv2D(64, (7, 7), strides=(2, 2), name='conv1', use_bias=True)(x)
@@ -154,25 +186,25 @@ def resnet_graph(input_image, architecture, stage5=False):
     x = KL.Activation('relu')(x)
     C1 = x = KL.MaxPooling2D((3, 3), strides=(2, 2), padding="same")(x)
     # Stage 2
-    x = conv_block(x, 3, [64, 64, 256], stage=2, block='a', strides=(1, 1))
-    x = identity_block(x, 3, [64, 64, 256], stage=2, block='b')
-    C2 = x = identity_block(x, 3, [64, 64, 256], stage=2, block='c')
+    x = conv_block(x, 3, [64, 64, 256], stage=2, block='a', strides=(1, 1), cardinality = cardinality)
+    x = identity_block(x, 3, [64, 64, 256], stage=2, block='b', cardinality = cardinality)
+    C2 = x = identity_block(x, 3, [64, 64, 256], stage=2, block='c', cardinality = cardinality)
     # Stage 3
-    x = conv_block(x, 3, [128, 128, 512], stage=3, block='a')
-    x = identity_block(x, 3, [128, 128, 512], stage=3, block='b')
-    x = identity_block(x, 3, [128, 128, 512], stage=3, block='c')
-    C3 = x = identity_block(x, 3, [128, 128, 512], stage=3, block='d')
+    x = conv_block(x, 3, [128, 128, 512], stage=3, block='a', cardinality = cardinality)
+    x = identity_block(x, 3, [128, 128, 512], stage=3, block='b', cardinality = cardinality)
+    x = identity_block(x, 3, [128, 128, 512], stage=3, block='c', cardinality = cardinality)
+    C3 = x = identity_block(x, 3, [128, 128, 512], stage=3, block='d', cardinality = cardinality)
     # Stage 4
-    x = conv_block(x, 3, [256, 256, 1024], stage=4, block='a')
+    x = conv_block(x, 3, [256, 256, 1024], stage=4, block='a', cardinality = cardinality)
     block_count = {"resnet50": 5, "resnet101": 22}[architecture]
     for i in range(block_count):
-        x = identity_block(x, 3, [256, 256, 1024], stage=4, block=chr(98 + i))
+        x = identity_block(x, 3, [256, 256, 1024], stage=4, block=chr(98 + i), cardinality = cardinality)
     C4 = x
     # Stage 5
     if stage5:
-        x = conv_block(x, 3, [512, 512, 2048], stage=5, block='a')
-        x = identity_block(x, 3, [512, 512, 2048], stage=5, block='b')
-        C5 = x = identity_block(x, 3, [512, 512, 2048], stage=5, block='c')
+        x = conv_block(x, 3, [512, 512, 2048], stage=5, block='a', cardinality = cardinality)
+        x = identity_block(x, 3, [512, 512, 2048], stage=5, block='b', cardinality = cardinality)
+        C5 = x = identity_block(x, 3, [512, 512, 2048], stage=5, block='c', cardinality = cardinality)
     else:
         C5 = None
     return [C1, C2, C3, C4, C5]
@@ -1788,7 +1820,8 @@ class MaskRCNN():
         # Bottom-up Layers
         # Returns a list of the last layers of each stage, 5 in total.
         # Don't create the thead (stage 5), so we pick the 4th item in the list.
-        _, C2, C3, C4, C5 = resnet_graph(input_image, "resnet101", stage5=True)
+        _, C2, C3, C4, C5 = resnet_graph(input_image, "resnet101",
+                                         stage5=True, use_resnext=True)
         # Top-down Layers
         # TODO: add assert to varify feature map sizes match what's in config
         P5 = KL.Conv2D(256, (1, 1), name='fpn_c5p5')(C5)
