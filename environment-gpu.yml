@@ -1,0 +1,24 @@
+name: mask_rcnn
+channels:
+    - https://conda.anaconda.org/menpo
+    - conda-forge
+dependencies:
+    - python=3.5
+    - matplotlib
+    - numpy
+    - opencv3
+    - pillow
+    - scipy
+    - tensorflow-gpu=1.3.*
+    - scikit-learn
+    - scikit-image
+    - h5py
+    - eventlet
+    - seaborn
+    - pandas
+    - ffmpeg
+    - imageio
+    - keras
+    - cython
+    - pip:
+        - moviepy
